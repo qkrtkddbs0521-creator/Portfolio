@@ -1,19 +1,35 @@
-# Portfolio
-Data to Graph_final.py
+Portfolio Automation Tools
+デザインワークフローやデータ処理の効率化を目的として開発したPython自動化ツールのポートフォリオです。
 
-엑셀 데이터를 통해 퉁계분석을 해준 후 그 통계분석량을 자동으로 디자인이 완료된 그래프 이미지로 생성해 준다.
+1. Data to Graph (Data to Graph_final.py)
+エクセル・CSVデータを読み込んで統計分析を実行し、デザイン性の高いグラフ画像として自動生成するツールです。
 
-SNS_데이터_분류완료_수정됨(중요).csv -> 파일 예시
+主な機能:
 
+データの統計分析の自動処理
 
+分析結果を視覚化したデザイン済みグラフ画像の自動生成
 
-0619Imagecrop2.1-Final.py
+使用例（入力データ）: SNS_데이터_분류완료_수정됨(중요).csv
 
-디자이너에게 요청하는 이미지 단순반복작업을 자동화
-thumb_origin 폴더 안의 로고 파일을 자동으로 편집하여 thumb_cropped_resized로 자동으로 단순 편집한다.
+2. Image Crop Automation (0619Imagecrop2.1-Final.py)
+デザイナーが日常的に行う単純・反復的な画像編集作業を自動化するスクリプトです。
 
+主な機能:
 
-Mockupautomation-Final.py
+thumb_origin フォルダ内の元画像（ロゴなど）を一括自動編集
 
-UI디자인의 화면 목업을 생성해주는 간단한 프로그램
-이미지가 들어간 폴더를 선택하고 슬라이더를 조작하고 Generate를 누르면 목업 이미지를 생성한다. Save를 누르면 저장한다.
+クロップおよびリサイズ処理を適用し、thumb_cropped_resized フォルダへ自動保存
+
+3. UI Mockup Automation (Mockupautomation-Final.py)
+UIデザインの画面モックアップを素早く簡単に作成できるプログラムです。
+
+主な機能:
+
+画像が格納されたフォルダの選択
+
+スライダー操作によるリアルタイムな調整
+
+「Generate」ボタンによるモックアップ画像の自動生成
+
+「Save」ボタンによる結果の保存
