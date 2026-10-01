@@ -17,7 +17,7 @@
 
 ---
 
-### 2. Winner Selection Automation (select_winners.py)
+### 2. Winner Selection Automation (winnerselector20240604ver82-로그함수사분위수이거쓸것.py)
 SNSイベントのコメントデータから、当選者を公正かつ自動で選定するツールです。テキストの内容量やメンション数をスコア化し、確率的重み付けによるランダム抽選を行います。
 
 * **主な機能**:
