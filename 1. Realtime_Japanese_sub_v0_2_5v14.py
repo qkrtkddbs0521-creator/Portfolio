@@ -55,6 +55,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QRectF, QPoint,
 from PyQt5.QtGui import (QFont, QCursor, QColor, QFontDatabase, QIcon, QPixmap,
                          QPainter, QPen, QPainterPath, QRegion)
 from PyQt5.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QDoubleSpinBox, QMessageBox
+import importlib.util
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment
@@ -63,17 +64,12 @@ except ImportError:
     HAS_OPENPYXL = False
 from google import genai
 
-# ---- 애니메이션 특화 STT 모델 (litagin/anime-whisper, transformers 파이프라인) ----
-# large-v3를 애니메이션/게임 성우 음성 5,300시간으로 파인튜닝한 모델. 일반 large-v3보다
-# 애니메이션 말투·감정 표현을 훨씬 잘 잡아낸다는 보고가 있어 통째로 이걸로 교체한다.
-# (faster_whisper 패키지 자체는 지우지 않고, 음성 구간 검출(VAD)과 오디오 디코딩
-#  유틸리티(decode_audio/get_speech_timestamps)만 그대로 재사용한다.)
+# [변경] transformers는 무거워서 앱 시작 때마다 수 초씩 걸린다. 설치 여부만
+# find_spec으로 가볍게 확인해두고, 실제 import는 자막 생성을 처음 돌릴 때
+# (_process_job)로 미룬다.
 ANIME_WHISPER_MODEL_ID = "litagin/anime-whisper"
-try:
-    from transformers import pipeline as _hf_asr_pipeline
-    HAS_ANIME_WHISPER = True
-except ImportError:
-    HAS_ANIME_WHISPER = False
+HAS_ANIME_WHISPER = importlib.util.find_spec("transformers") is not None
+if not HAS_ANIME_WHISPER:
     print("경고: transformers 미설치로 anime-whisper를 쓸 수 없습니다. "
           "pip install --upgrade transformers 로 설치하세요.")
 
@@ -85,6 +81,11 @@ except ImportError:
 VLC_HW = os.getenv("VLC_HW", "dxva2")   # 계속 깨지면 "none"으로
 VLC_INSTANCE_ARGS = ['--no-sub-autodetect-file', f'--avcodec-hw={VLC_HW}', '--quiet']
 import vlc
+
+# [변경] demucs도 torchaudio 등을 줄줄이 끌고 들어오는 무거운 패키지라,
+# 설치 여부만 미리 확인하고 실제 import는 보컬 분리를 처음 할 때로 미룬다.
+# (apply_model/get_model은 어차피 코드 어디서도 안 쓰여서 그냥 삭제)
+HAS_DEMUCS = importlib.util.find_spec("demucs.api") is not None
 
 import demucs.api
 try:
@@ -1074,6 +1075,7 @@ class SubtitleQueueWorker(QThread):
         disp = display_path or source_path
         if not HAS_DEMUCS:
             return source_path
+        import demucs.api   # [변경] 실제로 쓸 때만 로드
         try:
             if self._separator is None:
                 self._progress(disp, "1/5단계: 음성 정제용 Demucs AI 모델(htdemucs_ft) 로딩 중...")
@@ -1207,7 +1209,7 @@ class SubtitleQueueWorker(QThread):
 
         if not HAS_ANIME_WHISPER:
             raise RuntimeError("transformers 미설치: pip install --upgrade transformers 실행 후 다시 시도하세요.")
-
+        import demucs.api   # [변경] 실제로 쓸 때만 로드
         from faster_whisper.audio import decode_audio
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
@@ -1251,9 +1253,10 @@ class SubtitleQueueWorker(QThread):
 
             if self._anime_pipe is None:
                 self._progress(path, "2/5단계: anime-whisper 모델 로딩 중 (첫 실행은 다운로드로 오래 걸릴 수 있음)...")
+                from transformers import pipeline as hf_pipeline   # [변경] 실제 사용 시점에만 로드
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 torch_dtype = torch.float16 if device == "cuda" else torch.float32
-                self._anime_pipe = _hf_asr_pipeline(
+                self._anime_pipe = hf_pipeline(
                     "automatic-speech-recognition",
                     model=ANIME_WHISPER_MODEL_ID,
                     device=device,
@@ -1268,14 +1271,17 @@ class SubtitleQueueWorker(QThread):
 
             self._progress(path, "3/5단계: 음성 구간 검출(VAD) 중...")
             audio = decode_audio(clean_audio_path, sampling_rate=16000)
-            vad_options = VadOptions(threshold=0.6, min_speech_duration_ms=200,
-                                      min_silence_duration_ms=300, speech_pad_ms=150)
+            vad_options = VadOptions(threshold=0.5, min_speech_duration_ms=200,
+                                     max_speech_duration_s=15,   # ← 추가: 15초 넘으면 자동으로 끊어줌
+                                     speech_pad_ms=150)
             speech_chunks = get_speech_timestamps(audio, vad_options=vad_options)
 
             self._progress(path, "3/5단계: 일본어 애니메이션 정밀 STT 분석 중...")
-
             total_chunks = len(speech_chunks)
             BATCH = 16
+            empty_count = 0
+            RETRY_PAD = int(0.3 * 16000)   # 빈 결과 재시도 시 앞뒤로 더 넓힐 여유(0.3초)
+
             for i in range(0, total_chunks, BATCH):
                 if self._cancel_current:
                     return None
@@ -1284,7 +1290,7 @@ class SubtitleQueueWorker(QThread):
                 clips = [audio[c['start']:c['end']] for c in batch_chunks]
                 inputs = [{"array": clip, "sampling_rate": 16000} for clip in clips]
                 results = pipe(inputs, generate_kwargs=gen_kwargs, batch_size=len(inputs))
-                if isinstance(results, dict):   # 배치가 1개뿐이면 파이프라인이 dict 하나만 돌려줌
+                if isinstance(results, dict):
                     results = [results]
 
                 percent = int(((i + len(batch_chunks)) / max(total_chunks, 1)) * 100)
@@ -1292,8 +1298,21 @@ class SubtitleQueueWorker(QThread):
 
                 for c, r in zip(batch_chunks, results):
                     text = (r.get("text") or "").strip()
+
                     if not text:
-                        continue
+                        # VAD는 말소리라고 판단했는데 모델이 빈 결과를 낸 경우 — 조용한 대사나
+                        # 경계에서 잘린 경우일 수 있으니, 앞뒤로 더 넓혀서 한 번만 재시도한다.
+                        wide_start = max(0, c['start'] - RETRY_PAD)
+                        wide_end = min(len(audio), c['end'] + RETRY_PAD)
+                        try:
+                            retry = pipe({"array": audio[wide_start:wide_end], "sampling_rate": 16000},
+                                         generate_kwargs=gen_kwargs)
+                            text = (retry.get("text") or "").strip()
+                        except Exception:
+                            text = ""
+                        if not text:
+                            empty_count += 1
+                            continue
 
                     seg_start = map_time(c['start'] / 16000.0)
                     seg_end = map_time(c['end'] / 16000.0)
@@ -1304,7 +1323,7 @@ class SubtitleQueueWorker(QThread):
                         'end': seg_end,
                         'text': text,
                         'phonetic': phonetic,
-                        'words': []   # anime-whisper는 단어별 타임스탬프를 안 주므로, VAD 구간 자체를 타이밍으로 쓴다
+                        'words': []
                     })
         finally:
             if clean_audio_path.endswith("_vocals.wav") and os.path.exists(clean_audio_path):
@@ -1319,18 +1338,19 @@ class SubtitleQueueWorker(QThread):
                     pass
 
         # [추가] 과거에 자막 편집기에서 고쳤던 STT 오인식은 여기서 자동으로 반영한다.
-        stt_fix_map = load_stt_correction_map()
-        if stt_fix_map:
+        stt_entries = load_stt_correction_entries()
+        if stt_entries:
             fixed_count = 0
             for seg in raw_segments:
-                fixed = stt_fix_map.get(_norm_key(seg['text']))
+                fixed = find_stt_fix(seg['text'], stt_entries)
                 if fixed and fixed != seg['text']:
                     seg['text'] = fixed
                     seg['phonetic'] = japanese_to_korean_phonetic(fixed)
                     fixed_count += 1
             if fixed_count:
-                print(f"[STT 교정] 과거에 고쳤던 표현 {fixed_count}건을 자동 반영했습니다.")
-
+                print(f"[STT 교정] 과거 교정과 비슷한 표현 {fixed_count}건을 자동 반영했습니다.")
+            if empty_count:
+               print(f"[STT] 소리는 감지됐지만 인식에 실패해 건너뛴 구간: {empty_count}개")
         total_segs = len(raw_segments)
         segments = []
 
@@ -1836,6 +1856,7 @@ class OutlinedLabel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._outline_width = 0
+        self._outline_opacity = 255
         self._alignment = Qt.AlignCenter
         self._fill_style = None      # 마지막으로 적용한 스타일시트 (같으면 재적용 생략)
         self._outline_style = None
@@ -1919,9 +1940,12 @@ class OutlinedLabel(QWidget):
     def set_colors(self, text_color, outline_color, outline_width, outline_opacity=255):
         self._outline_width = max(0, min(self.MAX_OUTLINE_WIDTH, int(outline_width)))
         fill_style = f"color: {QColor(text_color).name()}; background: transparent;"
-        oc = QColor(outline_color)
-        oc.setAlpha(max(0, min(255, int(outline_opacity))))
-        outline_style = f"color: rgba({oc.red()}, {oc.green()}, {oc.blue()}, {oc.alpha()}); background: transparent;"
+        # [중요] 복제본 자체는 완전 불투명(알파 255)으로만 찍는다. 반투명 색으로 여러 겹
+        # 찍으면 겹치는 부분마다 알파가 계속 누적돼 두께가 커질수록(=복제본이 많아질수록)
+        # 점점 진해지다 뭉개져 보이는 문제가 있었다. 사용자가 고른 투명도(outline_opacity)는
+        # 전부 찍어서 합친 뒤 '맨 마지막에 전체 한 번만' 적용한다(아래 paintEvent).
+        outline_style = f"color: {QColor(outline_color).name()}; background: transparent;"
+        self._outline_opacity = max(0, min(255, int(outline_opacity)))
         if fill_style != self._fill_style:
             self._fill_label.setStyleSheet(fill_style)
             self._fill_style = fill_style
@@ -1931,6 +1955,7 @@ class OutlinedLabel(QWidget):
             self._outline_style = outline_style
         self.updateGeometry()
         self._relayout()
+        self.update()
 
     def heightForWidth(self, w):
         ow = self._outline_width
@@ -1950,19 +1975,49 @@ class OutlinedLabel(QWidget):
         ow = self._outline_width
         inner_w = max(1, w - 2 * ow)
         inner_h = max(1, h - 2 * ow)
-        needed = self._needed_steps()
-        # 두께에 맞춰 계산된 방향 수만큼만 원(반지름 ow) 위에 배치해 보이고,
-        # 나머지 미리 만들어둔 복제본은 숨긴다.
-        for i, lbl in enumerate(self._outline_labels):
-            if i < needed:
-                ang = 2 * math.pi * i / needed
-                dx = int(round(ow * math.cos(ang)))
-                dy = int(round(ow * math.sin(ang)))
-                lbl.setGeometry(ow + dx, ow + dy, inner_w, inner_h)
-                lbl.setVisible(True)
-            else:
-                lbl.setVisible(False)
+        # 복제본들은 더 이상 화면에 직접 보이는 자식 위젯이 아니라, paintEvent에서
+        # render()로 오프스크린에 찍어내는 용도로만 쓴다(항상 숨김). 위치는 전부
+        # 원점(0,0)에 두고, 실제 둘레 오프셋은 paintEvent에서 render() 호출 시의
+        # targetOffset으로 준다 — 그래야 모든 복제본이 '완전 불투명'으로 같은
+        # 버퍼 위에 겹쳐 찍히고, 겹치는 부분에서 알파가 누적되지 않는다.
+        for lbl in self._outline_labels:
+            lbl.setGeometry(0, 0, inner_w, inner_h)
+            lbl.setVisible(False)
         self._fill_label.setGeometry(ow, ow, inner_w, inner_h)
+
+    def paintEvent(self, event):
+        ow = self._outline_width
+        if ow <= 0 or not self._raw_text.strip():
+            return   # 두께 0(기본값)이거나 텍스트가 없으면 외곽선 레이어를 그릴 필요 없음
+
+        w, h = self.width(), self.height()
+        inner_w = max(1, w - 2 * ow)
+        inner_h = max(1, h - 2 * ow)
+        needed = self._needed_steps()
+
+        # 1단계: 완전 불투명 상태로 필요한 방향 수만큼 겹쳐 찍어 '테두리 실루엣'을 만든다.
+        # 전부 같은 불투명 색이라 아무리 많이 겹쳐도 더 진해지거나 뭉개지지 않는다.
+        canvas = QPixmap(w, h)
+        canvas.fill(Qt.transparent)
+        cpainter = QPainter(canvas)
+        cpainter.setRenderHint(QPainter.Antialiasing)
+        for i in range(needed):
+            ang = 2 * math.pi * i / needed
+            dx = ow + int(round(ow * math.cos(ang)))
+            dy = ow + int(round(ow * math.sin(ang)))
+            self._outline_labels[i].render(cpainter, QPoint(dx, dy))
+        cpainter.end()
+
+        # 2단계: 사용자가 고른 투명도를 완성된 실루엣 전체에 '딱 한 번만' 적용한다.
+        if self._outline_opacity < 255:
+            apainter = QPainter(canvas)
+            apainter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            apainter.fillRect(canvas.rect(), QColor(0, 0, 0, self._outline_opacity))
+            apainter.end()
+
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, canvas)
+        # self._fill_label은 자식 위젯이라 Qt가 이 paintEvent 다음에 자동으로 그 위에 그린다.
 
 
 class SubtitleOverlayWindow(QWidget):
@@ -2565,6 +2620,47 @@ CORRECTIONS_FILE = os.path.join(_APP_DIR, "subtitle_corrections.json")
 
 STT_CORRECTIONS_FILE = os.path.join(_APP_DIR, "stt_text_corrections.json")
 
+FUZZY_STT_FIX_THRESHOLD = 0.82
+FUZZY_STT_MIN_LEN = 5   # 이보다 짧은 문장은 퍼지 매칭 생략(오탐 방지), 완전일치만 허용
+
+def load_stt_correction_entries():
+    """퍼지 매칭용 (정규화된 과거 오인식, 고친 문장) 쌍 전체 목록."""
+    try:
+        with open(STT_CORRECTIONS_FILE, "r", encoding="utf-8") as f:
+            log = json.load(f)
+        if not isinstance(log, list):
+            return []
+    except Exception:
+        return []
+    entries = []
+    for entry in log:
+        before = (entry.get("before") or "").strip()
+        after = (entry.get("after") or "").strip()
+        if before and after:
+            entries.append((_norm_key(before), after))
+    return entries
+
+
+def find_stt_fix(text, entries, threshold=FUZZY_STT_FIX_THRESHOLD, min_len=FUZZY_STT_MIN_LEN):
+    """지금 인식된 text와 과거에 고쳤던 표현들을 비교해, 완전히 같으면 즉시,
+    충분히 비슷하면(threshold 이상) 그 고친 버전을 돌려준다. 짧은 문장은
+    완전일치만 허용해 서로 다른 짧은 대사를 잘못 바꿔치기하는 걸 막는다."""
+    key = _norm_key(text)
+    if not key:
+        return None
+    best_after, best_score = None, 0.0
+    for before_key, after in entries:
+        if before_key == key:
+            return after
+        if len(key) < min_len or len(before_key) < min_len:
+            continue
+        if abs(len(before_key) - len(key)) > 4:
+            continue   # 길이 차이가 크면 비교할 필요 없음 (속도용 컷)
+        score = SequenceMatcher(None, before_key, key).ratio()
+        if score > best_score:
+            best_after, best_score = after, score
+    return best_after if best_score >= threshold else None
+
 def load_stt_correction_map():
     """자막 편집기에서 사용자가 고친 '일본어 원문(STT 결과)' 이력을 불러와,
     다음 인식 때 같은 오인식을 자동으로 고치기 위한 사전을 만든다.
@@ -2710,13 +2806,15 @@ SETTING_SPECS = {
     "overlay_outline_width": _s_num(0, 30, int),
     "overlay_outline_opacity": _s_num(0, 255, int),
     "overlay_bg_color": _s_color, "overlay_bg_opacity": _s_num(0, 255, int),
-    "ov_x_ratio": _s_num(0.0, 1.0, float), "ov_y_ratio": _s_num(0.0, 1.0, float),
+    # 자막을 플레이어 창 밖(영상 영역 바깥)으로도 옮길 수 있게 범위를 넓힘
+    "ov_x_ratio": _s_num(-0.5, 1.5, float), "ov_y_ratio": _s_num(-0.5, 1.5, float),
     "ov_w_ratio": _s_num(0.08, 1.0, float), "ov_min_h_ratio": _s_num(0.03, 1.0, float),
     "subtitle_display_mode": _s_choice("overlay", "side_left", "side_right"),
     "mode": _s_choice("sentence", "word"),
     "topmost_mode": _s_choice("always", "playing", "off"),
     "hide_console": _s_bool,
     "playlist_visible": _s_bool, "playlist_show_all": _s_bool, "auto_next": _s_bool,
+    "show_phonetic_line": _s_bool, "show_meaning_line": _s_bool,
     "last_dir": _s_text,
     "extra_folders": _s_str_list,
     "long_vowel_style": _s_choice("repeat", "dash"),
@@ -2843,6 +2941,52 @@ class VideoStage(QWidget):
         self._on_resize()
 
 
+SUBTITLE_MAX_CHARS = 40     # 이 길이를 넘으면 나눠서 보여준다
+SUBTITLE_MIN_BEAT_SEC = 1.2
+_SENT_END_RE = re.compile(r'(?<=[.!?。！？])\s*')
+
+
+def split_sentences(text):
+    """문장 끝(. ! ? 。！？) 기준으로만 나눈다. 그래도 한 문장이 너무 길면(아래
+    split_subtitle_text 기준) 그 문장 안에서만 공백 기준으로 추가로 쪼갠다 —
+    즉 "문장과 문장 사이"가 아닌 지점에서는 절대 끊지 않아서 뜻이 훼손되지 않는다."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in _SENT_END_RE.split(text) if p.strip()]
+    if not parts:
+        return [text]
+    out = []
+    for p in parts:
+        out.extend(split_subtitle_text(p))
+    return out or [text]
+
+def split_subtitle_text(text, max_chars=SUBTITLE_MAX_CHARS):
+    """긴 자막 텍스트를 문장부호(. ! ? 줄바꿈) 우선으로, 그래도 길면
+    공백 기준으로 max_chars 이하 덩어리들로 나눈다."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    parts = re.split(r'(?<=[.!?])\s+|\n+', text)
+    parts = [p.strip() for p in parts if p.strip()]
+    chunks = []
+    for part in parts:
+        if len(part) <= max_chars:
+            chunks.append(part)
+            continue
+        words = part.split(' ')
+        cur = ""
+        for w in words:
+            cand = (cur + " " + w).strip() if cur else w
+            if len(cand) > max_chars and cur:
+                chunks.append(cur)
+                cur = w
+            else:
+                cur = cand
+        if cur:
+            chunks.append(cur)
+    return chunks or [text]
+
 # 2. 학습용 플레이어 창 (VLC 임베딩)
 class AnimeSubtitlePlayer(QWidget):
 
@@ -2859,7 +3003,8 @@ class AnimeSubtitlePlayer(QWidget):
         self.resize_edge = None
         self.resize_start_geo = None
         self.resize_start_mouse = None
-
+        self._kanji_beats = []
+        self._meaning_beats = []
         self.segments = []
         self.current_index = 0
         self.mode = "sentence"  # "sentence" 또는 "word"
@@ -2915,6 +3060,8 @@ class AnimeSubtitlePlayer(QWidget):
         self.playlist_visible = True   # 재생 목록 패널 표시
         self.playlist_show_all = False  # True면 폴더 안 모든 영상, False면 비슷한 이름만
         self.auto_next = True          # 영상이 끝나면 목록의 다음 영상 자동 재생
+        self.show_phonetic_line = True  # 끄면 "🗣️ 발음: ..." 줄이 숨겨짐
+        self.show_meaning_line = True   # 끄면 "💡 뜻: ..." 줄이 숨겨짐
         self.last_dir = ""
         self.extra_folders = []
         self.saved_window_geometry = None
@@ -2974,6 +3121,7 @@ class AnimeSubtitlePlayer(QWidget):
 
         # 오버레이 창은 video_frame이 만들어진 뒤에 생성
         self.subtitle_overlay = SubtitleOverlayWindow(self)
+        # (한국어 발음·뜻의 실제 표시 여부는 set_meaning_text가 내용이 있는지로 판단해 처리)
 
         self.apply_subtitle_layout(self.subtitle_display_mode)
 
@@ -3586,9 +3734,10 @@ class AnimeSubtitlePlayer(QWidget):
             if self.current_index != active_idx:
                 self.current_index = active_idx
                 self.show_current_segment(jump_player=False)
+            else:
+                seg = self.segments[active_idx]
+                self._update_beat_display(current_sec - seg['start'])   # ← 추가된 줄    
             return
-        # 대사 사이 침묵 구간으로 이동한 경우: 인덱스는 실제 위치에 맞춰 갱신하고
-        # 화면은 비워서, 다음 대사가 나올 때 곧바로 정확히 갱신되게 한다.
         past_idx = None
         for idx, seg in enumerate(self.segments):
             if seg['start'] <= current_sec:
@@ -3647,10 +3796,14 @@ class AnimeSubtitlePlayer(QWidget):
 
     # ---------------- 오버레이 자막(창 안의 창) 위치/크기 계산 ----------------
     def update_overlay_geometry(self):
-        """video_frame의 현재 화면 좌표를 기준으로 오버레이 창의 위치/크기를
-        다시 계산한다. 저장된 비율(ov_x_ratio 등)을 그대로 따르되, 자막
-        텍스트가 넘칠 경우 높이를 자동으로 늘리고, 그 결과 영상 하단을
-        넘어서면 위쪽으로 확장되도록(아래쪽 기준선은 고정) 보정한다."""
+        """플레이어 창 전체의 현재 화면 좌표를 기준으로 오버레이 창의 위치/크기를
+        다시 계산한다. 저장된 비율(ov_x_ratio 등)을 그대로 따르고, 자막 텍스트가
+        넘칠 경우 높이만 자동으로 늘린다.
+        [중요] 예전에는 '영상(video_frame) 영역 안으로만' 강제로 가둬서, 사용자가
+        자막을 영상 밖(재생목록 쪽 등)으로 옮겨도 다음 재계산 때 도로 영상 안으로
+        끌려들어왔다. 이제는 기준을 플레이어 창 전체로 바꾸고, 완전히 화면 밖으로
+        사라지지만 않을 정도로만 아주 느슨하게 보정해서, 사용자가 옮긴 자리를
+        그대로 존중한다(자동으로 원래 자리로 리셋하지 않음)."""
         if not hasattr(self, "subtitle_overlay"):
             return
 
@@ -3659,18 +3812,17 @@ class AnimeSubtitlePlayer(QWidget):
             self.subtitle_overlay.hide()
             return
 
-        frame = self.video_frame
-        fw, fh = frame.width(), frame.height()
+        # 기준 = 영상(video_frame)이 아니라 플레이어 창 전체. 자막을 재생목록/
+        # 제목줄 쪽으로 옮겨도, 심지어 영상 밖으로 옮겨도 그 자리를 유지한다.
+        fw, fh = self.width(), self.height()
         if fw <= 0 or fh <= 0:
             return
 
-        origin = frame.mapToGlobal(QPoint(0, 0))
+        origin = self.mapToGlobal(QPoint(0, 0))
 
-        # 좌우로 잘리지 않도록 폭을 영상 폭 안으로 제한
         w = max(self.subtitle_overlay.MIN_W, int(self.ov_w_ratio * fw))
-        w = min(w, fw - 4)
+        w = min(w, fw)
         x = int(self.ov_x_ratio * fw)
-        x = max(0, min(x, fw - w))
 
         # 줄바꿈을 반영한 실제 필요 높이 계산
         inner_w = max(10, w - 24)
@@ -3681,13 +3833,14 @@ class AnimeSubtitlePlayer(QWidget):
 
         min_h = max(self.subtitle_overlay.MIN_H, int(self.ov_min_h_ratio * fh))
         h = max(min_h, needed_h)
-        h = min(h, fh)  # 영상보다 커지지는 않게
 
         y = int(self.ov_y_ratio * fh)
-        # 자막이 넘쳐서 아래쪽으로 커지면 영상 하단을 넘지 않도록 위로 밀어올림
-        if y + h > fh:
-            y = max(0, fh - h)
-        y = max(0, min(y, fh - self.subtitle_overlay.MIN_H))
+
+        # 완전히 화면 밖으로 사라지는 것만 막는다 (영상 영역 안으로 강제로
+        # 되돌리지 않음 — 사용자가 옮긴 자리를 존중).
+        VISIBLE_MARGIN = 24
+        x = max(-w + VISIBLE_MARGIN, min(x, fw - VISIBLE_MARGIN))
+        y = max(-h + VISIBLE_MARGIN, min(y, fh - VISIBLE_MARGIN))
 
         new_geo = QRect(origin.x() + x, origin.y() + y, w, h)
         # 창을 드래그로 줄이는 동안 이 함수가 아주 짧은 간격으로 계속 불려서, 값이 1px씩만
@@ -3706,29 +3859,32 @@ class AnimeSubtitlePlayer(QWidget):
         self.bring_overlay_above()
 
     def on_overlay_user_moved(self, geo):
-        """사용자가 오버레이를 드래그로 옮긴 뒤, video_frame 대비 비율로 저장."""
-        frame = self.video_frame
-        fw, fh = frame.width(), frame.height()
+        """사용자가 오버레이를 드래그로 옮긴 뒤, 플레이어 창 전체 대비 비율로 저장.
+        기준이 영상이 아니라 창 전체이므로, 영상 밖(재생목록 쪽 등)으로 옮겨도
+        그 비율이 그대로 저장되어 다음에도 그 자리를 유지한다. 0~1로 강제 clamp
+        하지 않아서(완만하게만 제한) 창 가장자리에 걸쳐 놓는 것도 가능하다."""
+        fw, fh = self.width(), self.height()
         if fw <= 0 or fh <= 0:
             return
-        origin = frame.mapToGlobal(QPoint(0, 0))
-        self.ov_x_ratio = max(0.0, min(1.0, (geo.x() - origin.x()) / fw))
-        self.ov_y_ratio = max(0.0, min(1.0, (geo.y() - origin.y()) / fh))
+        origin = self.mapToGlobal(QPoint(0, 0))
+        self.ov_x_ratio = max(-0.5, min(1.5, (geo.x() - origin.x()) / fw))
+        self.ov_y_ratio = max(-0.5, min(1.5, (geo.y() - origin.y()) / fh))
+        self.schedule_save_settings()
 
     def on_overlay_user_resized(self, geo):
         """사용자가 오버레이 모서리를 드래그로 리사이즈한 뒤, 비율로 저장.
         이후 update_overlay_geometry가 이 값을 최소 크기로 사용하고,
         텍스트가 더 길면 자동으로 더 확장한다."""
-        frame = self.video_frame
-        fw, fh = frame.width(), frame.height()
+        fw, fh = self.width(), self.height()
         if fw <= 0 or fh <= 0:
             return
-        origin = frame.mapToGlobal(QPoint(0, 0))
-        self.ov_x_ratio = max(0.0, min(1.0, (geo.x() - origin.x()) / fw))
-        self.ov_y_ratio = max(0.0, min(1.0, (geo.y() - origin.y()) / fh))
+        origin = self.mapToGlobal(QPoint(0, 0))
+        self.ov_x_ratio = max(-0.5, min(1.5, (geo.x() - origin.x()) / fw))
+        self.ov_y_ratio = max(-0.5, min(1.5, (geo.y() - origin.y()) / fh))
         self.ov_w_ratio = max(0.08, min(1.0, geo.width() / fw))
         self.ov_min_h_ratio = max(0.03, min(1.0, geo.height() / fh))
         self.update_overlay_geometry()
+        self.schedule_save_settings()
 
     def reset_overlay_position(self):
         """우클릭 메뉴: 오버레이를 영상 하단 중앙 기본 위치/크기로 초기화."""
@@ -4055,6 +4211,20 @@ class AnimeSubtitlePlayer(QWidget):
             act.triggered.connect(lambda checked=False, m=mode: self.apply_subtitle_layout(m))
             layout_menu.addAction(act)
 
+        ph_act = QAction("🗣️ 한국어 발음(읽는 법) 표시", menu)
+        ph_act.setCheckable(True)
+        ph_act.setChecked(getattr(self, "show_phonetic_line", True))
+        ph_act.setToolTip("끄면 '🗣️ 발음: ...' 줄만 숨겨집니다.")
+        ph_act.triggered.connect(self.toggle_phonetic_line)
+        menu.addAction(ph_act)
+
+        mn_act = QAction("💡 한국어 뜻(번역) 표시", menu)
+        mn_act.setCheckable(True)
+        mn_act.setChecked(getattr(self, "show_meaning_line", True))
+        mn_act.setToolTip("끄면 '💡 뜻: ...' 줄만 숨겨집니다. 둘 다 끄면 일본어 원문만 보입니다.")
+        mn_act.triggered.connect(self.toggle_meaning_line)
+        menu.addAction(mn_act)
+
         menu.addSeparator()
 
         self._add_language_menu(menu, "🔤 일본어 자막 (원문)", "일본어", "kanji", QFontDatabase.Japanese)
@@ -4190,11 +4360,89 @@ class AnimeSubtitlePlayer(QWidget):
             if self.current_index > 0:
                 self.current_index -= 1
                 self.show_current_segment(jump_player=True)
+    
+    def _make_beats(self, text, total_duration):
+        """(단어장 모드 전용) text를 조각내고, 글자 수 비율대로 total_duration을
+        배분해 [(조각 텍스트, 이 조각이 끝나는 경과초), ...] 를 만든다."""
+        chunks = split_subtitle_text(text)
+        if len(chunks) <= 1:
+            return [(text, total_duration)]
+        lengths = [max(len(c), 1) for c in chunks]
+        total_len = sum(lengths)
+        beats, elapsed = [], 0.0
+        for i, (chunk, ln) in enumerate(zip(chunks, lengths)):
+            if i == len(chunks) - 1:
+                dur = max(total_duration - elapsed, SUBTITLE_MIN_BEAT_SEC)
+            else:
+                dur = max(total_duration * (ln / total_len), SUBTITLE_MIN_BEAT_SEC)
+            elapsed += dur
+            beats.append((chunk, elapsed))
+        return beats
+
+    def _pick_beat_text(self, beats, elapsed_in_seg):
+        for text, end_at in beats:
+            if elapsed_in_seg <= end_at:
+                return text
+        return beats[-1][0] if beats else ""
+
+    def _make_text_beats(self, chunks, total_duration):
+        """문장 단위로 나뉜 chunks를 글자 수 비율로 total_duration에 배분해
+        [(조각 텍스트, 끝나는 경과초), ...] 를 만든다. (기존 _pick_beat_text와 호환되는 형태)"""
+        if not chunks:
+            return []
+        if len(chunks) == 1:
+            return [(chunks[0], total_duration)]
+        lengths = [max(len(c), 1) for c in chunks]
+        total_len = sum(lengths)
+        beats, elapsed = [], 0.0
+        for i, (chunk, ln) in enumerate(zip(chunks, lengths)):
+            if i == len(chunks) - 1:
+                dur = max(total_duration - elapsed, SUBTITLE_MIN_BEAT_SEC)
+            else:
+                dur = max(total_duration * (ln / total_len), SUBTITLE_MIN_BEAT_SEC)
+            elapsed += dur
+            beats.append((chunk, elapsed))
+        return beats
+
+    def _make_jp_beats(self, jp_text, total_duration):
+        """문장 모드 전용: 일본어 원문을 문장 끝(.!?。！？) 기준으로 나누고, 각
+        조각의 발음을 그 자리에서 다시 만든다(이미 만들어진 전체 발음 문자열을
+        억지로 쪼개지 않아서 원문-발음 경계가 항상 100% 일치한다).
+        반환: [{'jp':.., 'ph':.., 'end':..}, ...]"""
+        jp_chunks = split_sentences(jp_text) or [jp_text]
+        return [{'jp': c, 'ph': japanese_to_korean_phonetic(c), 'end': end}
+                for c, end in self._make_text_beats(jp_chunks, total_duration)]
+
+    def _update_beat_display(self, elapsed_in_seg):
+        if getattr(self, "_beat_mode", "legacy") == "trio":
+            # [중요] 원문/발음은 원문 문장 수 기준 타이밍을, 뜻(번역)은 번역문 자체의
+            # 문장 수 기준 '별도' 타이밍을 쓴다. 번역은 의역 등으로 원문과 문장 수가
+            # 다른 경우가 흔해서, 예전처럼 "문장 수가 다르면 통째로 보여주기"로
+            # 두면 뜻만 안 끊기고 길게 나왔다. 이제 뜻도 항상 제 나름대로 문장
+            # 단위로는 끊어서 보여준다(원문과 타이밍이 완전히 같지는 않을 수 있음).
+            jp_beats = getattr(self, "_jp_beats", [])
+            beat = jp_beats[-1] if jp_beats else {'jp': '', 'ph': ''}
+            for b in jp_beats:
+                if elapsed_in_seg <= b['end']:
+                    beat = b
+                    break
+            mn_text = self._pick_beat_text(getattr(self, "_mn_beats", []), elapsed_in_seg)
+            self.set_kanji_text(beat['jp'])
+            lines = []
+            if getattr(self, "show_phonetic_line", True):
+                lines.append(f"🗣️ 발음: {beat['ph']}")
+            if getattr(self, "show_meaning_line", True):
+                lines.append(f"💡 뜻: {mn_text}")
+            self.set_meaning_text("\n".join(lines))
+        else:
+            self.set_kanji_text(self._pick_beat_text(self._kanji_beats, elapsed_in_seg))
+            self.set_meaning_text(self._pick_beat_text(self._meaning_beats, elapsed_in_seg))
 
     def show_current_segment(self, jump_player=False):
         if 0 <= self.current_index < len(self.segments):
             seg = self.segments[self.current_index]
             start_sec = seg['start']
+            duration = max(seg['end'] - seg['start'], 0.1)
             text = seg['text'].strip()
 
             mode_str = "📜 [문장 버전]" if self.mode == "sentence" else "📚 [단어장 버전]"
@@ -4202,10 +4450,11 @@ class AnimeSubtitlePlayer(QWidget):
                 f"애니 학습기 {mode_str} - [{self.current_index + 1} / {len(self.segments)}] ({int(start_sec)}초)")
 
             if self.mode == "sentence":
-                self.set_kanji_text(text)
-                phonetic = seg.get('phonetic', '')
                 ai_meaning = seg.get('meaning', '')
-                self.set_meaning_text(f"🗣️ 발음: {phonetic}\n💡 뜻: {ai_meaning}")
+                self._beat_mode = "trio"
+                self._jp_beats = self._make_jp_beats(text, duration)
+                mn_chunks = split_sentences(ai_meaning) or [ai_meaning]
+                self._mn_beats = self._make_text_beats(mn_chunks, duration)
             else:
                 vocab_list = seg.get('vocabulary', [])
                 if vocab_list:
@@ -4213,12 +4462,16 @@ class AnimeSubtitlePlayer(QWidget):
                     vocab_display = " | ".join(vocab_texts)
                 else:
                     vocab_display = "핵심 단어 정보 없음"
-
-                self.set_kanji_text(f"단어장: {vocab_display}")
+                kanji_full = f"단어장: {vocab_display}"
                 ai_meaning = seg.get('meaning', '번역 정보 없음')
-                self.set_meaning_text(f"💡 문장 전체 뜻: {ai_meaning}")
+                meaning_full = (f"💡 문장 전체 뜻: {ai_meaning}"
+                                if getattr(self, "show_meaning_line", True) else "")
+                self._beat_mode = "legacy"
+                self._kanji_beats = self._make_beats(kanji_full, duration)
+                self._meaning_beats = self._make_beats(meaning_full, duration)
 
-            # 수동 이동(버튼 클릭, 방향키 등) 시 실제 재생 위치도 함께 이동
+            self._update_beat_display(0.0)
+
             if jump_player:
                 self.media_player.set_time(int(start_sec * 1000))
 
@@ -4360,8 +4613,22 @@ class AnimeSubtitlePlayer(QWidget):
     def set_meaning_text(self, text):
         self.meaning_label.setText(text)
         self.subtitle_overlay.meaning_label.setText(text)
+        # 발음/뜻이 둘 다 꺼져서 내용이 비면 공간도 거의 차지하지 않게 라벨 자체를 숨긴다.
+        show = bool((text or "").strip())
+        self.meaning_box.setVisible(show)
+        self.subtitle_overlay.meaning_label.setVisible(show)
         if self.subtitle_display_mode == "overlay":
             self.update_overlay_geometry()
+
+    def toggle_phonetic_line(self):
+        self.show_phonetic_line = not self.show_phonetic_line
+        self.show_current_segment(jump_player=False)
+        self.schedule_save_settings()
+
+    def toggle_meaning_line(self):
+        self.show_meaning_line = not self.show_meaning_line
+        self.show_current_segment(jump_player=False)
+        self.schedule_save_settings()
 
     # ---------------- 마우스: 창 이동 + 테두리 리사이즈 ----------------
     def get_resize_edge(self, pos):
